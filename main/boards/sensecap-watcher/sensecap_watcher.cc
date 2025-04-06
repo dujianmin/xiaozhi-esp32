@@ -6,7 +6,9 @@
 #include "font_awesome_symbols.h"
 #include "application.h"
 #include "button.h"
+#include "knob.h"
 #include "config.h"
+#include "led/single_led.h"
 #include "iot/thing_manager.h"
 #include "power_save_timer.h"
 
@@ -20,6 +22,7 @@
 #include <driver/spi_common.h>
 #include <wifi_station.h>
 #include <iot_button.h>
+#include <iot_knob.h>
 #include <esp_io_expander_tca95xx_16bit.h>
 #include <esp_sleep.h>
 
@@ -33,6 +36,7 @@ class SensecapWatcher : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
     LcdDisplay* display_;
+    std::unique_ptr<Knob> knob_;
     esp_io_expander_handle_t io_exp_handle;
     button_handle_t btns;
     PowerSaveTimer* power_save_timer_;
@@ -82,6 +86,29 @@ private:
             },
         };
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
+
+        // pulldown for lcd i2c
+        const gpio_config_t io_config = {
+            .pin_bit_mask = (1ULL << BSP_TOUCH_I2C_SDA) | (1ULL << BSP_TOUCH_I2C_SCL) | (1ULL << BSP_SPI3_HOST_PCLK) | (1ULL << BSP_SPI3_HOST_DATA0) | (1ULL << BSP_SPI3_HOST_DATA1)
+                            | (1ULL << BSP_SPI3_HOST_DATA2) | (1ULL << BSP_SPI3_HOST_DATA3) | (1ULL << BSP_LCD_SPI_CS) | (1UL << DISPLAY_BACKLIGHT_PIN),
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&io_config);
+
+        gpio_set_level(BSP_TOUCH_I2C_SDA, 0);
+        gpio_set_level(BSP_TOUCH_I2C_SCL, 0);
+    
+        gpio_set_level(BSP_LCD_SPI_CS, 0);
+        gpio_set_level(DISPLAY_BACKLIGHT_PIN, 0);
+        gpio_set_level(BSP_SPI3_HOST_PCLK, 0);
+        gpio_set_level(BSP_SPI3_HOST_DATA0, 0);
+        gpio_set_level(BSP_SPI3_HOST_DATA1, 0);
+        gpio_set_level(BSP_SPI3_HOST_DATA2, 0);
+        gpio_set_level(BSP_SPI3_HOST_DATA3, 0);
+
     }
 
     esp_err_t IoExpanderSetLevel(uint16_t pin_mask, uint8_t level) {
@@ -112,6 +139,41 @@ private:
         ESP_LOGI(TAG, "IO expander initialized: %x", DRV_IO_EXP_OUTPUT_MASK | (uint16_t)pin_val);
     
         assert(ret == ESP_OK);
+    }
+
+    void OnKnobRotate(bool clockwise) {
+        auto codec = GetAudioCodec();
+        int current_volume = codec->output_volume();
+        int new_volume = current_volume + (clockwise ? 5 : -5);
+
+        // 确保音量在有效范围内
+        if (new_volume > 100) {
+            new_volume = 100;
+            ESP_LOGW(TAG, "Volume reached maximum limit: %d", new_volume);
+        } else if (new_volume < 0) {
+            new_volume = 0;
+            ESP_LOGW(TAG, "Volume reached minimum limit: %d", new_volume);
+        }
+
+        codec->SetOutputVolume(new_volume);
+        ESP_LOGI(TAG, "Volume changed from %d to %d", current_volume, new_volume);
+        
+        // 显示通知前检查实际变化
+        if (new_volume != codec->output_volume()) {
+            ESP_LOGE(TAG, "Failed to set volume! Expected:%d Actual:%d", 
+                   new_volume, codec->output_volume());
+        }
+        GetDisplay()->ShowNotification("音量: " + std::to_string(codec->output_volume()));
+        power_save_timer_->WakeUp();
+    }
+
+    void InitializeKnob() {
+        knob_ = std::make_unique<Knob>(BSP_KNOB_A_PIN, BSP_KNOB_B_PIN);
+        knob_->OnRotate([this](bool clockwise) {
+            ESP_LOGD(TAG, "Knob rotation detected. Clockwise:%s", clockwise ? "true" : "false");
+            OnKnobRotate(clockwise);
+        });
+        ESP_LOGI(TAG, "Knob initialized with pins A:%d B:%d", BSP_KNOB_A_PIN, BSP_KNOB_B_PIN);
     }
 
     void InitializeButton() {
@@ -216,18 +278,13 @@ private:
                 .emoji_font = font_emoji_64_init(),
             });
         
-        // 使每次刷新的行数是4的倍数，防止花屏
+        // 使每次刷新的起始列数索引是4的倍数且列数总数是4的倍数，以满足SPD2010的要求
         lv_display_add_event_cb(lv_display_get_default(), [](lv_event_t *e) {
                 lv_area_t *area = (lv_area_t *)lv_event_get_param(e);
                 uint16_t x1 = area->x1;
                 uint16_t x2 = area->x2;
                 // round the start of area down to the nearest 4N number
                 area->x1 = (x1 >> 2) << 2;
-                // round the start of area down to the nearest 4N number
-                area->x1 = (x1 >> 2) << 2;
-              
-                // round the end of area up to the nearest 4M+3 number
-                area->x2 = ((x2 >> 2) << 2) + 3;
                 // round the end of area up to the nearest 4M+3 number
                 area->x2 = ((x2 >> 2) << 2) + 3;
         }, LV_EVENT_INVALIDATE_AREA, NULL);
@@ -238,7 +295,7 @@ private:
     void InitializeIot() {
         auto& thing_manager = iot::ThingManager::GetInstance();
         thing_manager.AddThing(iot::CreateThing("Speaker"));
-        thing_manager.AddThing(iot::CreateThing("Backlight"));
+        thing_manager.AddThing(iot::CreateThing("Screen"));
     }
 
 public:
@@ -249,6 +306,7 @@ public:
         InitializeSpi();
         InitializeExpander();
         InitializeButton();
+        InitializeKnob();
         Initializespd2010Display();
         InitializeIot();
         GetBacklight()->RestoreBrightness();
@@ -278,6 +336,14 @@ public:
     virtual Backlight* GetBacklight() override {
         static PwmBacklight backlight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
         return &backlight;
+    }
+
+    // 根据 https://github.com/Seeed-Studio/OSHW-SenseCAP-Watcher/blob/main/Hardware/SenseCAP_Watcher_v1.0_SCH.pdf
+    // RGB LED型号为 ws2813 mini, 连接在GPIO 40，供电电压 3.3v, 没有连接 BIN 双信号线
+    // 可以直接兼容SingleLED采用的ws2812
+    virtual Led* GetLed() override {
+        static SingleLed led(BUILTIN_LED_GPIO);
+        return &led;
     }
 
     virtual void SetPowerSaveMode(bool enabled) override {
